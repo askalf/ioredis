@@ -270,44 +270,25 @@ PROTOCOLS.forEach((protocol, index) => {
       );
     });
 
-    it("does not restore the db when the failed command is itself a SELECT", async () => {
-      // Control: green with and without the fix. `item.command.name !==
-      // "select"` keeps the restoring call from firing at all here, so the
-      // guarded line is never reached and the resent SELECT settles normally.
-      const server = serverAcceptingSelect(basePort + 6);
-      const redis = client(basePort + 6, true);
-      await redis.connect();
-
-      const errors: string[] = [];
-      redis.on("error", (err: Error) => errors.push(err.message));
-
-      const selects: number[] = [];
-      redis.on("select", (db: number) => selects.push(db));
-
-      const result = await redis.select(3);
-      await new Promise((resolve) => setTimeout(resolve, 500));
-
-      redis.disconnect();
-      await server.disconnectPromise();
-
-      expect(unhandled, "must not surface as an unhandled rejection").to.eql(
-        []
-      );
-      expect(errors, "a plain SELECT must not emit an error").to.eql([]);
-      expect(result, "the SELECT must settle").to.eql("OK");
-      expect(selects, "the db must be switched exactly once").to.eql([3]);
-    });
-
-    it("resends the command after a successful db restoration", async () => {
-      // Control: green with and without the fix. Pins that guarding the
-      // restoring SELECT does not disturb the path it guards -- no spurious
-      // error event, and the resent command still settles.
+    it("resends the command after a successful db restoration (control)", async () => {
+      // Green on both arms by design: it reaches the guarded call and comes
+      // out the same, which is what makes it a control rather than a
+      // regression case. It pins that routing the restoring SELECT through
+      // `.catch` does not disturb the path it guards -- no spurious error
+      // event, and the resent command still settles.
       const server = serverAcceptingSelect(basePort + 4);
       const redis = client(basePort + 4, true);
       await redis.connect();
 
       const errors: string[] = [];
       redis.on("error", (err: Error) => errors.push(err.message));
+
+      // `select` is emitted whenever a SELECT actually changes the connection's
+      // db, so this records the restoration itself rather than assuming it. A
+      // control that never executed the guarded line would prove nothing, and
+      // the trailing 0 is the restoring SELECT the guard wraps.
+      const selects: number[] = [];
+      redis.on("select", (db: number) => selects.push(db));
 
       const failing = redis.get("foo");
       const switching = redis.select(2).catch(() => {});
@@ -317,6 +298,10 @@ PROTOCOLS.forEach((protocol, index) => {
       redis.disconnect();
       await server.disconnectPromise();
 
+      expect(
+        selects,
+        "the guarded restoring SELECT must have run, back to db 0"
+      ).to.eql([2, 0]);
       expect(unhandled, "must not surface as an unhandled rejection").to.eql(
         []
       );
