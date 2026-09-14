@@ -270,6 +270,49 @@ PROTOCOLS.forEach((protocol, index) => {
       );
     });
 
+    it("issues one restoring SELECT for several commands dropped together", async () => {
+      // handleReconnection runs once per dropped command, so three in flight
+      // walk the guarded line three times. Only the first one restores: the
+      // `SELECT` updates `condition.select` synchronously in sendCommand
+      // (lib/Redis.ts:655-662), so the `this.condition?.select !== item.select`
+      // guard is already false for the other two. That is worth pinning --
+      // it is what keeps the failure to a single error event rather than one
+      // per command -- and all three commands must still be resent.
+      const server = serverRejectingSelect(basePort + 6);
+      const redis = client(basePort + 6, true);
+      await redis.connect();
+
+      const errors: string[] = [];
+      redis.on("error", (err: Error) => errors.push(err.message));
+
+      const results = [
+        redis.get("foo").catch((err: Error) => err.message),
+        redis.get("bar").catch((err: Error) => err.message),
+        redis.get("baz").catch((err: Error) => err.message),
+      ];
+      const switching = redis.select(2).catch(() => {});
+
+      const settled = await Promise.all(results);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      await switching;
+
+      redis.disconnect();
+      await server.disconnectPromise();
+
+      expect(unhandled, "must not surface as an unhandled rejection").to.eql(
+        []
+      );
+      expect(
+        errors.filter((message) => message === INVALID_DB_INDEX).length,
+        "the guard disarms after the first restore, so exactly one error"
+      ).to.eql(1);
+      expect(settled, "all three dropped commands must be resent").to.eql([
+        "OK",
+        "OK",
+        "OK",
+      ]);
+    });
+
     it("resends the command after a successful db restoration (control)", async () => {
       // Green on both arms by design: it reaches the guarded call and comes
       // out the same, which is what makes it a control rather than a
