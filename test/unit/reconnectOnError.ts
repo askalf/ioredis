@@ -59,7 +59,56 @@ PROTOCOLS.forEach((protocol, index) => {
       return server;
     }
 
-    function client(port: number, enableOfflineQueue: boolean) {
+    // As above, but only the named db is rejected. Lets a test drive the
+    // restoring `SELECT` to a non-zero db without the reconnect's own
+    // handshake `SELECT` failing for the same reason, which would satisfy the
+    // assertions on both arms and prove nothing.
+    function serverRejectingDb(port: number, db: number) {
+      let connections = 0;
+      const server = new MockServer(port, (argv) => {
+        const name = String(argv[0]).toLowerCase();
+        if (name === "info") {
+          return "# Server\r\nredis_version:7.0.0\r\n";
+        }
+        if (name === "get" && connections < 2) {
+          return new Error(READONLY_ERROR);
+        }
+        if (
+          name === "select" &&
+          connections >= 2 &&
+          String(argv[1]) === String(db)
+        ) {
+          return new Error(INVALID_DB_INDEX);
+        }
+        return "OK";
+      });
+      server.on("connect", () => connections++);
+      return server;
+    }
+
+    // Never rejects `select`, so the db restoration succeeds. Used to check
+    // that the added `.catch` does not disturb the path it guards.
+    function serverAcceptingSelect(port: number) {
+      let connections = 0;
+      const server = new MockServer(port, (argv) => {
+        const name = String(argv[0]).toLowerCase();
+        if (name === "info") {
+          return "# Server\r\nredis_version:7.0.0\r\n";
+        }
+        if (name === "get" && connections < 2) {
+          return new Error(READONLY_ERROR);
+        }
+        return "OK";
+      });
+      server.on("connect", () => connections++);
+      return server;
+    }
+
+    function client(
+      port: number,
+      enableOfflineQueue: boolean,
+      extraOptions: Record<string, unknown> = {}
+    ) {
       return new Redis({
         port,
         protocol,
@@ -72,6 +121,7 @@ PROTOCOLS.forEach((protocol, index) => {
         // restoring SELECT's own failure does not re-enter this branch.
         reconnectOnError: (err: Error) =>
           err.message.startsWith("READONLY") ? 2 : false,
+        ...extraOptions,
       });
     }
 
@@ -129,6 +179,149 @@ PROTOCOLS.forEach((protocol, index) => {
       expect(errors, "the client's error listener must receive it").to.include(
         "Stream isn't writeable and enableOfflineQueue options is false"
       );
+    });
+
+    it("surfaces a failing db-restoring SELECT when no error listener is registered", async () => {
+      // silentEmit falls back to logging when nothing is listening, so the
+      // rejection must still be consumed. This is the configuration that made
+      // the unguarded call fatal: a client with no `error` listener has
+      // nothing that could have handled the promise either.
+      const server = serverRejectingSelect(basePort + 2);
+      const redis = client(basePort + 2, true);
+      await redis.connect();
+
+      const failing = redis.get("foo").catch(() => {});
+      const switching = redis.select(2).catch(() => {});
+      await Promise.all([failing, switching]);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+
+      redis.disconnect();
+      await server.disconnectPromise();
+
+      expect(unhandled, "must not surface as an unhandled rejection").to.eql(
+        []
+      );
+    });
+
+    it("surfaces a failing db-restoring SELECT for a non-zero db", async () => {
+      // The db being restored is the command's own `select`, not the client's
+      // configured `db`. Restoring a non-zero db exercises a different value
+      // than the other cases, which all restore db 0.
+      const server = serverRejectingDb(basePort + 3, 5);
+      const redis = client(basePort + 3, true);
+      await redis.connect();
+
+      const errors: string[] = [];
+      redis.on("error", (err: Error) => errors.push(err.message));
+
+      await redis.select(5);
+      const failing = redis.get("foo").catch(() => {});
+      const switching = redis.select(2).catch(() => {});
+      await Promise.all([failing, switching]);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+
+      redis.disconnect();
+      await server.disconnectPromise();
+
+      expect(unhandled, "must not surface as an unhandled rejection").to.eql(
+        []
+      );
+      // The emitted error is the restoring SELECT's own, not the READONLY
+      // reply that triggered the reconnection: that one is not rejected here,
+      // its command is resent.
+      expect(
+        errors[0],
+        "the first error must be the restoring SELECT's own"
+      ).to.eql(INVALID_DB_INDEX);
+    });
+
+    it("surfaces a failing db-restoring SELECT when auto pipelining is enabled", async () => {
+      // `select` is one of notAllowedAutoPipelineCommands, so the restoring
+      // call goes through sendCommand and yields a Command promise even with
+      // enableAutoPipelining on -- which is what makes `.catch` available on
+      // it. The autopipeline must be allowed to flush `get` before `select(2)`
+      // is issued, otherwise both are batched into one tick, the in-flight
+      // command's db never diverges from `condition.select`, and the restoring
+      // call is not reached at all.
+      const server = serverRejectingSelect(basePort + 5);
+      const redis = client(basePort + 5, true, {
+        enableAutoPipelining: true,
+      });
+      await redis.connect();
+
+      const errors: string[] = [];
+      redis.on("error", (err: Error) => errors.push(err.message));
+
+      const failing = redis.get("foo").catch(() => {});
+      await new Promise((resolve) => setImmediate(resolve));
+      const switching = redis.select(2).catch(() => {});
+
+      await Promise.all([failing, switching]);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+
+      redis.disconnect();
+      await server.disconnectPromise();
+
+      expect(unhandled, "must not surface as an unhandled rejection").to.eql(
+        []
+      );
+      expect(errors, "the client's error listener must receive it").to.include(
+        INVALID_DB_INDEX
+      );
+    });
+
+    it("does not restore the db when the failed command is itself a SELECT", async () => {
+      // Control: green with and without the fix. `item.command.name !==
+      // "select"` keeps the restoring call from firing at all here, so the
+      // guarded line is never reached and the resent SELECT settles normally.
+      const server = serverAcceptingSelect(basePort + 6);
+      const redis = client(basePort + 6, true);
+      await redis.connect();
+
+      const errors: string[] = [];
+      redis.on("error", (err: Error) => errors.push(err.message));
+
+      const selects: number[] = [];
+      redis.on("select", (db: number) => selects.push(db));
+
+      const result = await redis.select(3);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+
+      redis.disconnect();
+      await server.disconnectPromise();
+
+      expect(unhandled, "must not surface as an unhandled rejection").to.eql(
+        []
+      );
+      expect(errors, "a plain SELECT must not emit an error").to.eql([]);
+      expect(result, "the SELECT must settle").to.eql("OK");
+      expect(selects, "the db must be switched exactly once").to.eql([3]);
+    });
+
+    it("resends the command after a successful db restoration", async () => {
+      // Control: green with and without the fix. Pins that guarding the
+      // restoring SELECT does not disturb the path it guards -- no spurious
+      // error event, and the resent command still settles.
+      const server = serverAcceptingSelect(basePort + 4);
+      const redis = client(basePort + 4, true);
+      await redis.connect();
+
+      const errors: string[] = [];
+      redis.on("error", (err: Error) => errors.push(err.message));
+
+      const failing = redis.get("foo");
+      const switching = redis.select(2).catch(() => {});
+      const [result] = await Promise.all([failing, switching]);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+
+      redis.disconnect();
+      await server.disconnectPromise();
+
+      expect(unhandled, "must not surface as an unhandled rejection").to.eql(
+        []
+      );
+      expect(errors, "a successful SELECT must not emit an error").to.eql([]);
+      expect(result, "the resent command must settle").to.eql("OK");
     });
   });
 });
