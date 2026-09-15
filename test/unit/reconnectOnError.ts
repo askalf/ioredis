@@ -312,6 +312,41 @@ PROTOCOLS.forEach((protocol, index) => {
         "OK",
       ]);
     });
+    it("surfaces a db-restoring SELECT abandoned when the client gives up reconnecting", async () => {
+      // The restoring SELECT does not have to be rejected by the server: with
+      // the offline queue on it is buffered while the client reconnects, and if
+      // `retryStrategy` declines to retry, closeHandler's close() sets the
+      // status to "end" and flushes the queues with Connection is closed
+      // (lib/redis/event_handler.ts:427-429). That rejection reaches the same
+      // guarded promise, so it is the second way the unguarded call crashed.
+      // `silentEmit` deliberately swallows it -- the client is ending and the
+      // user asked for that -- so this pins the no-unhandled-rejection half
+      // only, which is the half that was fatal.
+      const server = serverAcceptingSelect(basePort + 7);
+      const redis = client(basePort + 7, true, {
+        retryStrategy: () => null,
+      });
+      await redis.connect();
+
+      const errors: string[] = [];
+      redis.on("error", (err: Error) => errors.push(err.message));
+
+      const failing = redis.get("foo").catch((err: Error) => err.message);
+      const switching = redis.select(2).catch(() => {});
+
+      const failed = await failing;
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      await switching;
+      await server.disconnectPromise();
+
+      expect(unhandled, "must not surface as an unhandled rejection").to.eql(
+        []
+      );
+      expect(
+        failed,
+        "the dropped command is rejected by the queue flush, not resent"
+      ).to.eql("Connection is closed.");
+    });
 
     it("resends the command after a successful db restoration (control)", async () => {
       // Green on both arms by design: it reaches the guarded call and comes
